@@ -12,13 +12,13 @@ export default function RetrievePage() {
   const isComplete = trimmed.length === 6;
 
   function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const raw = e.target.value.replace(/[^a-zA-Z0-9]/g, "").slice(0, 6);
+    const raw = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
     setCode(raw);
   }
 
   function handleRetrieve() {
     if (!isComplete) return;
-    router.push(`/clip/${trimmed}`);
+    router.push(`/clip/${trimmed.toUpperCase()}`);
   }
 
   return (
@@ -83,7 +83,7 @@ export default function RetrievePage() {
           </button>
 
           <p className="text-xs text-black/35 dark:text-white/35 mt-5 text-center">
-            Codes are not case-sensitive — type in any case.
+            Codes use capital letters and numbers only.
           </p>
 
         </div>
