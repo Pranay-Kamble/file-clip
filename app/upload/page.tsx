@@ -20,6 +20,8 @@ const WARN_TOTAL_SIZE_BYTES = 500 * 1024 * 1024;  // warn if total > 500 MB
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 type ExpiryOption = { label: string; value: string };
 type ToastItem    = { id: number; message: string; type: "error" | "warn" };
+type UploadStatus = "idle" | "uploading" | "done" | "error";
+type FileProgress = { name: string; status: "pending" | "uploading" | "done" | "error" };
 
 const EXPIRY_OPTIONS: ExpiryOption[] = [
   { label: "1 hour",   value: "1h"  },
@@ -46,11 +48,17 @@ function formatBytes(bytes: number): string {
 export default function HomePage() {
 
   // ── STATE ──
-  const [files,      setFiles]      = useState<File[]>([]);
-  const [expiry,     setExpiry]     = useState("24h");
-  const [isDragging, setIsDragging] = useState(false);
-  const [toasts,     setToasts]     = useState<ToastItem[]>([]);
-  const { isDark, toggleTheme }     = useTheme();
+  const [files,          setFiles]          = useState<File[]>([]);
+  const [expiry,         setExpiry]         = useState("24h");
+  const [isDragging,     setIsDragging]     = useState(false);
+  const [toasts,         setToasts]         = useState<ToastItem[]>([]);
+  const [uploadStatus,   setUploadStatus]   = useState<UploadStatus>("idle");
+  const [fileProgress,   setFileProgress]   = useState<FileProgress[]>([]);
+  const [clipCode,       setClipCode]       = useState<string | null>(null);
+  const [copiedCode,     setCopiedCode]     = useState(false);
+  const [copiedUrl,      setCopiedUrl]      = useState(false);
+  const [qrSharing,      setQrSharing]      = useState(false);
+  const { isDark, toggleTheme }             = useTheme();
 
   // ── REFS ──
   const fileInputRef  = useRef<HTMLInputElement>(null);
@@ -127,10 +135,146 @@ export default function HomePage() {
   function handleDragLeave() { setIsDragging(false); }
 
   // ── UPLOAD HANDLER ──
-  // For now just logs — real API call wired in the next step.
-  function handleUpload() {
-    console.log("Uploading:", files, "Expiry:", expiry);
-    alert("Upload wiring coming soon!");
+  async function handleUpload() {
+    if (files.length === 0 || uploadStatus === "uploading") return;
+
+    setUploadStatus("uploading");
+    setFileProgress(files.map(f => ({ name: f.name, status: "pending" })));
+
+    let presignData: {
+      code: string;
+      files: { filename: string; stagingKey: string; presignedPutURL: string; confirmToken: string }[];
+    };
+
+    try {
+      const res = await fetch("/api/upload/presign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          files: files.map(f => ({ name: f.name, mimeType: f.type || "application/octet-stream" })),
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error ?? "Failed to get presigned URLs");
+      }
+
+      presignData = await res.json();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to get presigned URLs";
+      showToast(msg, "error");
+      setUploadStatus("error");
+      return;
+    }
+
+    const confirmEntries: { stagingKey: string; confirmToken: string }[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file        = files[i];
+      const presignFile = presignData.files[i];
+
+      setFileProgress(prev =>
+        prev.map((p, idx) => idx === i ? { ...p, status: "uploading" } : p)
+      );
+
+      try {
+        const putRes = await fetch(presignFile.presignedPutURL, {
+          method: "PUT",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+
+        if (!putRes.ok) throw new Error(`S3 upload failed for ${file.name}`);
+
+        setFileProgress(prev =>
+          prev.map((p, idx) => idx === i ? { ...p, status: "done" } : p)
+        );
+
+        confirmEntries.push({
+          stagingKey:   presignFile.stagingKey,
+          confirmToken: presignFile.confirmToken,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : `Upload failed for ${file.name}`;
+        showToast(msg, "error");
+        setFileProgress(prev =>
+          prev.map((p, idx) => idx === i ? { ...p, status: "error" } : p)
+        );
+        setUploadStatus("error");
+        return;
+      }
+    }
+
+    try {
+      const confirmRes = await fetch("/api/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: confirmEntries, expiry }),
+      });
+
+      if (!confirmRes.ok) {
+        const err = await confirmRes.json().catch(() => ({}));
+        throw new Error(err.error ?? "Failed to confirm upload");
+      }
+
+      const { code } = await confirmRes.json();
+      setClipCode(code);
+      setUploadStatus("done");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to confirm upload";
+      showToast(msg, "error");
+      setUploadStatus("error");
+    }
+  }
+
+  // ── QR HELPERS ──
+  function qrImageUrl(code: string) {
+    const shareUrl = `${window.location.origin}/clip/${code}`;
+    return `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&data=${encodeURIComponent(shareUrl)}`;
+  }
+
+  async function handleQrDownload() {
+    if (!clipCode) return;
+    try {
+      const res  = await fetch(qrImageUrl(clipCode));
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `fileclip-${clipCode}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      showToast("Failed to download QR code.", "error");
+    }
+  }
+
+  async function handleQrShare() {
+    if (!clipCode) return;
+    setQrSharing(true);
+    const shareUrl = `${window.location.origin}/clip/${clipCode}`;
+    try {
+      if (navigator.canShare) {
+        const res  = await fetch(qrImageUrl(clipCode));
+        const blob = await res.blob();
+        const file = new File([blob], `fileclip-${clipCode}.png`, { type: "image/png" });
+        if (navigator.canShare({ files: [file] })) {
+          await navigator.share({ title: `FileClip · ${clipCode}`, url: shareUrl, files: [file] });
+        } else {
+          await navigator.share({ title: `FileClip · ${clipCode}`, url: shareUrl });
+        }
+      } else {
+        await navigator.clipboard.writeText(shareUrl);
+        showToast("Share URL copied to clipboard.", "warn");
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== "AbortError") {
+        showToast("Could not share QR code.", "error");
+      }
+    } finally {
+      setQrSharing(false);
+    }
   }
 
   // ── COMPUTED VALUES ──
@@ -263,21 +407,144 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* ── UPLOAD BUTTON ── */}
-          <button
-            onClick={handleUpload}
-            disabled={files.length === 0}
-            className={[
-              "mt-6 w-full py-3 rounded-xl font-semibold text-sm transition-all duration-150",
-              files.length === 0
-                ? "bg-black/10 dark:bg-white/10 text-black/30 dark:text-white/30 cursor-not-allowed"
-                : "bg-black text-white dark:bg-white dark:text-black hover:opacity-80",
-            ].join(" ")}
-          >
-            {files.length === 0
-              ? "Select files to upload"
-              : `Upload ${files.length} file${files.length > 1 ? "s" : ""} · ${selectedLabel}`}
-          </button>
+          {/* ── UPLOAD PROGRESS ── */}
+          {uploadStatus === "uploading" && fileProgress.length > 0 && (
+            <div className="mt-4 space-y-1">
+              {fileProgress.map((fp) => (
+                <div key={fp.name} className="flex items-center gap-2 text-xs text-black/60 dark:text-white/60">
+                  <span className="flex-1 truncate">{fp.name}</span>
+                  <span className={
+                    fp.status === "done"     ? "text-green-600 dark:text-green-400" :
+                    fp.status === "error"    ? "text-red-500" :
+                    fp.status === "uploading" ? "animate-pulse" : ""
+                  }>
+                    {fp.status === "done" ? "✓" : fp.status === "error" ? "✕" : fp.status === "uploading" ? "↑ uploading…" : "waiting"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── SUCCESS PANEL ── */}
+          {uploadStatus === "done" && clipCode ? (
+            <div className="mt-6 rounded-2xl border border-black/10 dark:border-white/10 overflow-hidden">
+
+              {/* Header */}
+              <div className="bg-black dark:bg-white px-5 py-4 flex items-center gap-3">
+                <span className="text-white dark:text-black text-xl">✓</span>
+                <div>
+                  <p className="text-sm font-semibold text-white dark:text-black leading-tight">Upload complete</p>
+                  <p className="text-xs text-white/60 dark:text-black/50">
+                    {files.length} file{files.length > 1 ? "s" : ""} · expires in {selectedLabel}
+                  </p>
+                </div>
+              </div>
+
+              {/* Code block */}
+              <div className="px-5 py-5 flex flex-col items-center gap-1 border-b border-black/10 dark:border-white/10">
+                <p className="text-xs text-black/40 dark:text-white/40 mb-1 uppercase tracking-widest">Your clip code</p>
+                <p className="font-mono text-5xl font-bold tracking-[0.25em] text-black dark:text-white select-all">
+                  {clipCode}
+                </p>
+                <p className="text-xs text-black/35 dark:text-white/35 mt-1">Share this code to let others retrieve your files</p>
+              </div>
+
+              {/* Action buttons */}
+              <div className="px-5 py-4 flex flex-col gap-2">
+                {/* Copy code */}
+                <button
+                  id="copy-code-btn"
+                  onClick={() => {
+                    navigator.clipboard.writeText(clipCode);
+                    setCopiedCode(true);
+                    setTimeout(() => setCopiedCode(false), 2000);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-black/15 dark:border-white/15 text-sm font-medium hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                >
+                  <span>{copiedCode ? "✓" : "⎘"}</span>
+                  {copiedCode ? "Code copied!" : "Copy code"}
+                </button>
+
+                {/* Copy share URL */}
+                <button
+                  id="copy-url-btn"
+                  onClick={() => {
+                    const shareUrl = `${window.location.origin}/clip/${clipCode}`;
+                    navigator.clipboard.writeText(shareUrl);
+                    setCopiedUrl(true);
+                    setTimeout(() => setCopiedUrl(false), 2000);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-black/15 dark:border-white/15 text-sm font-medium hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                >
+                  <span>{copiedUrl ? "✓" : "🔗"}</span>
+                  {copiedUrl ? "URL copied!" : "Copy share URL"}
+                </button>
+
+                {/* View files link */}
+                <a
+                  id="view-files-link"
+                  href={`/clip/${clipCode}`}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-black text-white dark:bg-white dark:text-black text-sm font-semibold hover:opacity-80 transition-opacity"
+                >
+                  View files →
+                </a>
+              </div>
+
+              {/* QR code */}
+              <div className="px-5 py-5 border-t border-black/10 dark:border-white/10 flex flex-col items-center gap-3">
+                <p className="text-xs text-black/40 dark:text-white/40 uppercase tracking-widest">Scan to retrieve</p>
+                <div className="rounded-xl overflow-hidden border border-black/10 dark:border-white/10 p-2 bg-white">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={qrImageUrl(clipCode)}
+                    alt={`QR code for clip ${clipCode}`}
+                    width={180}
+                    height={180}
+                    className="block"
+                  />
+                </div>
+                <p className="text-xs text-black/30 dark:text-white/30">Point your camera to open on another device</p>
+
+                {/* Download & Share buttons */}
+                <div className="flex gap-2 w-full">
+                  <button
+                    id="qr-download-btn"
+                    onClick={handleQrDownload}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl border border-black/15 dark:border-white/15 text-xs font-medium hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                  >
+                    ⬇ Download QR
+                  </button>
+                  <button
+                    id="qr-share-btn"
+                    onClick={handleQrShare}
+                    disabled={qrSharing}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl border border-black/15 dark:border-white/15 text-xs font-medium hover:bg-black/5 dark:hover:bg-white/5 transition-colors disabled:opacity-40"
+                  >
+                    {qrSharing ? "Sharing…" : "↗ Share QR"}
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          ) : (
+            /* ── UPLOAD BUTTON (only when not done) ── */
+            <button
+              onClick={handleUpload}
+              disabled={files.length === 0 || uploadStatus === "uploading"}
+              className={[
+                "mt-6 w-full py-3 rounded-xl font-semibold text-sm transition-all duration-150",
+                files.length === 0 || uploadStatus === "uploading"
+                  ? "bg-black/10 dark:bg-white/10 text-black/30 dark:text-white/30 cursor-not-allowed"
+                  : "bg-black text-white dark:bg-white dark:text-black hover:opacity-80",
+              ].join(" ")}
+            >
+              {uploadStatus === "uploading"
+                ? "Uploading…"
+                : files.length === 0
+                ? "Select files to upload"
+                : `Upload ${files.length} file${files.length > 1 ? "s" : ""} · ${selectedLabel}`}
+            </button>
+          )}
         </div>
       </section>
 
