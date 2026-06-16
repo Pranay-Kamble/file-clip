@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation"
 import Navbar from "@/components/Navbar"
 import ClipFileList from "./ClipFileList"
+import clientPromise from "@/lib/mongodb"
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 export interface ClipFile {
@@ -27,13 +28,12 @@ export default async function ClipPage({
   const { id } = await params
   const code = id.toUpperCase()
 
-  const res = await fetch(
-    `${process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000"}/api/clip/${code}`,
-    { cache: "no-store" }
-  )
+  const mongoClient = await clientPromise
+  const db = mongoClient.db('file-clip')
+  const clipDoc = await db.collection("clips").findOne({ code })
 
   // ── 404 — code never existed ──
-  if (res.status === 404) {
+  if (!clipDoc) {
     return (
       <ErrorPage
         code={code}
@@ -45,7 +45,7 @@ export default async function ClipPage({
   }
 
   // ── 410 — existed but expired ──
-  if (res.status === 410) {
+  if (new Date() > clipDoc.expiresAt) {
     return (
       <ErrorPage
         code={code}
@@ -56,9 +56,11 @@ export default async function ClipPage({
     )
   }
 
-  if (!res.ok) notFound()
-
-  const clip: ClipData = await res.json()
+  const clip: ClipData = {
+    code: clipDoc.code,
+    expiresAt: clipDoc.expiresAt.toISOString(),
+    files: clipDoc.files
+  }
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
