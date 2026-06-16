@@ -27,7 +27,7 @@ export async function GET(
     }
 
     const mongoClient = await clientPromise
-    const db = mongoClient.db()
+    const db = mongoClient.db('file-clip')
 
     const clip = await db.collection("clips").findOne({ code })
 

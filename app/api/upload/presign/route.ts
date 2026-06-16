@@ -47,7 +47,7 @@ export async function POST(req: Request) {
     const body = await req.json()
 
     const mongoClient = await clientPromise
-    const db = mongoClient.db()
+    const db = mongoClient.db('file-clip')
 
     let code = digitGenerator(6)
     let isUnique = false

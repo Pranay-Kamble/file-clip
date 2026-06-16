@@ -195,7 +195,7 @@ export async function POST(req: Request) {
     }
 
     const mongoClient = await clientPromise
-    const db = mongoClient.db()
+    const db = mongoClient.db('file-clip')
     await db.collection("clips").insertOne(clipDocument)
 
     return NextResponse.json({ code, expiresAt: expiresAt.toISOString() }, { status: 201 })
